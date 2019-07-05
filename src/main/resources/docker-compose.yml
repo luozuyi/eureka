@@ -1,0 +1,38 @@
+version: '2' # 表示该 Docker-Compose 文件使用的是 Version 2 file
+services:
+  liushu-eureka-server:  # 指定服务名称
+    build: #./Dockerfile-liushu-eureka  # 指定 Dockerfile 所在路径
+        context: .
+        dockerfile: ./Dockerfile-liushu-eureka
+    ports:    # 指定端口映射
+      - "28761:28761"
+    container_name: liushu-eureka-server
+    hostname: liushu-eureka-server
+   # expose:
+   #   - 28761
+   # extra_hosts:
+   #    - "liushu-eureka-server:192.168.1.180"
+   #enviroment:
+   #   - TZ=Asia/Shanghai
+  liushu-zuul-server:  # 指定服务名称
+    build: #./Dockerfile-liushu-zuul  # 指定 Dockerfile 所在路径
+        context: .
+        dockerfile: ./Dockerfile-liushu-zuul
+    #ports:    # 指定端口映射
+    #  - "18080:18080"
+   # ports:
+   #    - "18080-18085:18080"
+    #container_name: liushu-zuul-server
+   # hostname: liushu-zuul-server
+    #links:
+    #  - liushu-eureka-server:liushu-eureka-server
+    links:
+      - liushu-eureka-server:liushu-eureka-server
+    depends_on:
+      - liushu-eureka-server
+    #enviroment:
+    #  - TZ=Asia/Shanghai
+    #extra_hosts:
+    #   - "liushu-eureka-server:localhost"
+   # external_links:
+   #   - liushu-eureka-server
