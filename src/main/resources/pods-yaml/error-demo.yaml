@@ -1,0 +1,16 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: error-demo
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: error-demo
+    spec:
+      containers:
+      - name: error-demo
+        image: luozuyi/error-demo
+        ports:
+        - containerPort: 8088
