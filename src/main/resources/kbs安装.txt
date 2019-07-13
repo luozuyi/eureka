@@ -1,0 +1,440 @@
+https://www.kubernetes.org.cn/4956.html
+
+1.1系统配置
+在安装之前，需要先做如下准备。两台CentOS 7.4主机如下：
+192.168.1.88 master
+192.168.1.89 node1
+
+如果各个主机启用了防火墙，需要开放Kubernetes各个组件所需要的端口，可以查看Installing kubeadm中的”Check required ports”一节。 这里简单起见在各节点禁用防火墙：
+systemctl stop firewalld
+systemctl disable firewalld
+
+echo "vm.swappiness = 0">> /etc/sysctl.conf
+swapoff -a
+
+禁用SELINUX：
+setenforce 0
+vi /etc/selinux/config
+SELINUX=disabled
+
+创建/etc/sysctl.d/k8s.conf文件，添加如下内容：
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+执行命令使修改生效。
+modprobe br_netfilter
+sysctl -p /etc/sysctl.d/k8s.conf
+
+1.2kube-proxy开启ipvs的前置条件
+由于ipvs已经加入到了内核的主干，所以为kube-proxy开启ipvs的前提需要加载以下的内核模块：
+ip_vs
+ip_vs_rr
+ip_vs_wrr
+ip_vs_sh
+nf_conntrack_ipv4
+在所有的Kubernetes节点node1和node2上执行以下脚本:
+cat > /etc/sysconfig/modules/ipvs.modules <<EOF
+#!/bin/bash
+modprobe -- ip_vs
+modprobe -- ip_vs_rr
+modprobe -- ip_vs_wrr
+modprobe -- ip_vs_sh
+modprobe -- nf_conntrack_ipv4
+EOF
+chmod 755 /etc/sysconfig/modules/ipvs.modules && bash /etc/sysconfig/modules/ipvs.modules && lsmod | grep -e ip_vs -e nf_conntrack_ipv4
+上面脚本创建了的/etc/sysconfig/modules/ipvs.modules文件，保证在节点重启后能自动加载所需模块。 
+使用lsmod | grep -e ip_vs -e nf_conntrack_ipv4命令查看是否已经正确加载所需的内核模块。
+接下来还需要确保各个节点上已经安装了ipset软件包yum install ipset。 为了便于查看ipvs的代理规则，最好安装一下管理工具ipvsadm yum install ipvsadm。
+如果以上前提条件如果不满足，则即使kube-proxy的配置开启了ipvs模式，也会退回到iptables模式。
+
+
+
+1.3安装Docker
+Kubernetes从1.6开始使用CRI(Container Runtime Interface)容器运行时接口。默认的容器运行时仍然是Docker，使用的是kubelet中内置dockershim CRI实现。
+yum install -y yum-utils device-mapper-persistent-data lvm2
+yum-config-manager \
+    --add-repo \
+    https://download.docker.com/linux/centos/docker-ce.repo
+
+yum-config-manager \
+  --add-repo \
+  http://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+
+查看最新的Docker版本：
+yum list docker-ce.x86_64  --showduplicates |sort -r
+docker-ce.x86_64            3:18.09.0-3.el7                     docker-ce-stable
+docker-ce.x86_64            18.06.1.ce-3.el7                    docker-ce-stable
+docker-ce.x86_64            18.06.0.ce-3.el7                    docker-ce-stable
+docker-ce.x86_64            18.03.1.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            18.03.0.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.12.1.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.12.0.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.09.1.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.09.0.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.06.2.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.06.1.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.06.0.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.03.3.ce-1.el7                    docker-ce-stable
+docker-ce.x86_64            17.03.2.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.03.1.ce-1.el7.centos             docker-ce-stable
+docker-ce.x86_64            17.03.0.ce-1.el7.centos             docker-ce-stable
+
+Kubernetes 1.12已经针对Docker的1.11.1, 1.12.1, 1.13.1, 17.03, 17.06, 17.09, 18.06等版本做了验证，需要注意Kubernetes 1.12最低支持的Docker版本是1.11.1。
+Kubernetes 1.13对Docker的版本依赖方面没有变化。 我们这里在各节点安装docker的18.06.1版本。
+
+yum makecache fast
+
+yum install -y --setopt=obsoletes=0 \
+  docker-ce-18.06.1.ce-3.el7
+
+systemctl start docker
+systemctl enable docker
+
+确认一下iptables filter表中FOWARD链的默认策略(pllicy)为ACCEPT。
+iptables -nvL
+Chain INPUT (policy ACCEPT 263 packets, 19209 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+
+Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+    0     0 DOCKER-USER  all  --  *      *       0.0.0.0/0            0.0.0.0/0
+    0     0 DOCKER-ISOLATION-STAGE-1  all  --  *      *       0.0.0.0/0            0.0.0.0/0
+    0     0 ACCEPT     all  --  *      docker0  0.0.0.0/0            0.0.0.0/0            ctstate RELATED,ESTABLISHED
+    0     0 DOCKER     all  --  *      docker0  0.0.0.0/0            0.0.0.0/0
+    0     0 ACCEPT     all  --  docker0 !docker0  0.0.0.0/0            0.0.0.0/0
+    0     0 ACCEPT     all  --  docker0 docker0  0.0.0.0/0            0.0.0.0/0
+Docker从1.13版本开始调整了默认的防火墙规则，禁用了iptables filter表中FOWARD链，这样会引起Kubernetes集群中跨Node的Pod无法通信
+。但这里通过安装docker 1806，发现默认策略又改回了ACCEPT，这个不知道是从哪个版本改回的，因为我们线上版本使用的1706还是需要手动调整这个策略的。
+
+
+2.使用kubeadm部署Kubernetes
+2.1 安装kubeadm和kubelet
+下面在各节点安装kubeadm和kubelet：
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
+        https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOF
+
+
+#配置kubernetes.repo的源，由于官方源国内无法访问，这里使用阿里云yum源
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+
+yum makecache fast
+#在所有节点上安装指定版本 kubelet、kubeadm 和 kubectl
+#yum install -y kubernetes-cni-0.6.0-0.x86_64
+yum install -y kubelet-1.13.1 kubeadm-1.13.1 kubectl-1.13.1
+yum install -y kubelet-1.13.* kubeadm-1.13.* kubectl-1.13.*
+yum install -y kubelet-1.13.7 kubeadm-1.13.7 kubectl-1.13.7
+
+
+#启动kubelet服务
+systemctl enable kubelet && systemctl start kubelet
+
+
+测试地址https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64是否可用，如果不可用需要科学上网。
+curl https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+https://blog.csdn.net/networken/article/details/84991940
+
+yum makecache fast
+yum install -y kubelet-1.13.1 kubeadm-1.13.1 kubectl-1.13.1
+从安装结果可以看出还安装了cri-tools, kubernetes-cni, socat三个依赖：
+官方从Kubernetes 1.9开始就将cni依赖升级到了0.6.0版本，在当前1.12中仍然是这个版本
+socat是kubelet的依赖
+cri-tools是CRI(Container Runtime Interface)容器运行时接口的命令行工具
+
+运行kubelet –help可以看到原来kubelet的绝大多数命令行flag参数都被DEPRECATED了，如：
+......
+--address 0.0.0.0   The IP address for the Kubelet to serve on (set to 0.0.0.0 for all IPv4 interfaces and `::` for all IPv6 interfaces) (default 0.0.0.0) (DEPRECATED: This parameter should be set via the config file specified by the Kubelet's --config flag. See https://kubernetes.io/docs/tasks/administer-cluster/kubelet-config-file/ for more information.)
+......
+而官方推荐我们使用–config指定配置文件，并在配置文件中指定原来这些flag所配置的内容。具体内容可以查看这里Set Kubelet parameters via a config file。这也是Kubernetes为了支持动态Kubelet配置（Dynamic Kubelet Configuration）才这么做的，参考Reconfigure a Node’s Kubelet in a Live Cluster。
+
+kubelet的配置文件必须是json或yaml格式，具体可查看这里。
+
+Kubernetes 1.8开始要求关闭系统的Swap，如果不关闭，默认配置下kubelet将无法启动。
+swapoff -a
+修改 /etc/fstab 文件，注释掉 SWAP 的自动挂载，使用free -m确认swap已经关闭。 swappiness参数调整，修改/etc/sysctl.d/k8s.conf添加下面一行：
+vm.swappiness=0
+执行sysctl -p /etc/sysctl.d/k8s.conf使修改生效
+
+因为这里本次用于测试两台主机上还运行其他服务，关闭swap可能会对其他服务产生影响，所以这里修改kubelet的配置去掉这个限制。 之前的Kubernetes版本我们都是通过kubelet的启动参数–fail-swap-on=false去掉这个限制的。前面已经分析了Kubernetes不再推荐使用启动参数，而推荐使用配置文件。 所以这里我们改成配置文件配置的形式。
+
+查看/etc/systemd/system/kubelet.service.d/10-kubeadm.conf，看到了下面的内容：
+# Note: This dropin only works with kubeadm and kubelet v1.11+
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+# This is a file that "kubeadm init" and "kubeadm join" generates at runtime, populating the KUBELET_KUBEADM_ARGS variable dynamically
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+# This is a file that the user can use for overrides of the kubelet args as a last resort. Preferably, the user should use
+# the .NodeRegistration.KubeletExtraArgs object in the configuration files instead. KUBELET_EXTRA_ARGS should be sourced from this file.
+EnvironmentFile=-/etc/sysconfig/kubelet
+ExecStart=
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+上面显示kubeadm部署的kubelet的配置文件–config=/var/lib/kubelet/config.yaml，实际去查看/var/lib/kubelet和这个config.yaml的配置文件都没有被创建。 可以猜想肯定是运行kubeadm初始化集群时会自动生成这个配置文件，而如果我们不关闭Swap的话，第一次初始化集群肯定会失败的。
+
+所以还是老老实实的回到使用kubelet的启动参数–fail-swap-on=false去掉必须关闭Swap的限制。 修改/etc/sysconfig/kubelet，加入：
+KUBELET_EXTRA_ARGS=--fail-swap-on=false
+
+2.2 使用kubeadm init初始化集群
+在各节点开机启动kubelet服务：
+systemctl enable kubelet.service
+
+接下来使用kubeadm初始化集群，选择node1作为Master Node，在node1上执行下面的命令：
+kubeadm init \
+  --kubernetes-version=v1.13.1 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=192.168.2.88
+因为我们选择flannel作为Pod网络插件，所以上面的命令指定–pod-network-cidr=10.244.0.0/16。
+执行时报了下面的错误
+[init] using Kubernetes version: v1.13.0
+[preflight] running pre-flight checks
+[preflight] Some fatal errors occurred:
+        [ERROR Swap]: running with swap on is not supported. Please disable swap
+[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`
+有一个错误信息是running with swap on is not supported. Please disable swap。因为我们决定配置failSwapOn: false，所以重新添加–ignore-preflight-errors=Swap参数忽略这个错误，重新运行。
+kubeadm init \
+  --kubernetes-version=v1.13.1 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=192.168.2.88\
+  --image-repository registry.aliyuncs.com/google_containers \
+  --ignore-preflight-errors=Swap
+
+kubeadm init \
+  --kubernetes-version=v1.13.7 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=172.16.28.250\
+  --image-repository registry.aliyuncs.com/google_containers \
+  --ignore-preflight-errors=Swap
+
+kubeadm init \
+  --kubernetes-version=v1.13.7 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=172.16.38.146 \
+  --image-repository registry.aliyuncs.com/google_containers \
+  --ignore-preflight-errors=Swap
+其中有以下关键内容：
+
+[kubelet-start] 生成kubelet的配置文件”/var/lib/kubelet/config.yaml”
+[certificates]生成相关的各种证书
+[kubeconfig]生成相关的kubeconfig文件
+[bootstraptoken]生成token记录下来，后边使用kubeadm join往集群中添加节点时会用到
+下面的命令是配置常规用户如何使用kubectl访问集群：
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+最后给出了将节点加入集群的命令
+kubeadm join 192.168.2.88:6443 --token 9k9v3f.5nxs0wj56ya33zze --discovery-token-ca-cert-hash sha256:aa212b166d226bf373593b2c527e1980de7d63239fbdc9a9b420804acc0181d8 --ignore-preflight-errors=Swap
+
+ mkdir -p $HOME/.kube
+ sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+ sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+
+1.生成一条永久有效的token
+
+kubeadm token create --ttl 0
+# kubeadm token list
+TOKEN                     TTL         EXPIRES                     USAGES                   DESCRIPTION   EXTRA GROUPS
+dxnj79.rnj561a137ri76ym   <invalid>   2018-11-02T14:06:43+08:00   authentication,signing   <none>        system:bootstrappers:kubeadm:default-node-token
+o4avtg.65ji6b778nyacw68   <forever>   <never>                     authentication,signing   <none>        system:bootstrappers:kubeadm:default-node-token
+复制代码
+复制代码
+ 
+
+2.获取ca证书sha256编码hash值
+
+openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+2cc3029123db737f234186636330e87b5510c173c669f513a9c0e0da395515b0
+
+
+#创建普通用户并设置密码123456
+useradd centos && echo "centos:123456" | chpasswd centos
+
+#追加sudo权限,并配置sudo免密
+sed -i '/^root/a\centos  ALL=(ALL)       NOPASSWD:ALL' /etc/sudoers
+
+#保存集群安全配置文件到当前用户.kube目录
+su - centos
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+#启用 kubectl 命令自动补全功能（注销重新登录生效）
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+
+查看一下集群状态：
+kubectl get cs
+NAME                 STATUS    MESSAGE              ERROR
+controller-manager   Healthy   ok
+scheduler            Healthy   ok
+etcd-0               Healthy   {"health": "true"}
+确认个组件都处于healthy状态。
+
+集群初始化如果遇到问题，可以使用下面的命令进行清理：
+kubeadm reset
+ifconfig cni0 down
+ip link delete cni0
+ifconfig flannel.1 down
+ip link delete flannel.1
+rm -rf /var/lib/cni/
+
+2.3 安装Pod Network
+接下来安装flannel network add-on：
+mkdir -p ~/k8s/
+cd ~/k8s
+wget https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+kubectl apply -f  kube-flannel.yml
+
+clusterrole.rbac.authorization.k8s.io/flannel created
+clusterrolebinding.rbac.authorization.k8s.io/flannel created
+serviceaccount/flannel created
+configmap/kube-flannel-cfg created
+daemonset.extensions/kube-flannel-ds-amd64 created
+daemonset.extensions/kube-flannel-ds-arm64 created
+daemonset.extensions/kube-flannel-ds-arm created
+daemonset.extensions/kube-flannel-ds-ppc64le created
+daemonset.extensions/kube-flannel-ds-s390x created
+
+如果Node有多个网卡的话，参考flannel issues 39701，目前需要在kube-flannel.yml中使用–iface参数指定集群主机内网网卡的名称，
+否则可能会出现dns无法解析。需要将kube-flannel.yml下载到本地，flanneld启动参数加上–iface=<iface-name>
+
+使用kubectl get pod --all-namespaces -o wide确保所有的Pod都处于Running状态。
+
+2.4 master node参与工作负载
+使用kubeadm初始化的集群，出于安全考虑Pod不会被调度到Master Node上，也就是说Master Node不参与工作负载。
+这是因为当前的master节点node1被打上了node-role.kubernetes.io/master:NoSchedule的污点：
+kubectl describe node node1 | grep Taint
+Taints:             node-role.kubernetes.io/master:NoSchedule
+因为这里搭建的是测试环境，去掉这个污点使node1参与工作负载：
+kubectl taint nodes master node-role.kubernetes.io/master-
+node "master " untainted
+
+2.5 测试DNS
+kubectl run curl --image=radial/busyboxplus:curl -it
+
+
+如何从集群中移除Node
+如果需要从集群中移除node2这个Node执行下面的命令：
+
+在master节点上执行：
+kubectl drain node1 --delete-local-data --force --ignore-daemonsets
+kubectl delete node node1
+在node1上执行：
+kubeadm reset
+ifconfig cni0 down
+ip link delete cni0
+ifconfig flannel.1 down
+ip link delete flannel.1
+rm -rf /var/lib/cni/
+ipvsadm --clear
+在node1上执行
+kubectl delete node node2
+kubectl delete node node1
+
+yum install net-tools
+
+kubeadm reset
+systemctl stop kubelet
+systemctl stop docker
+rm -rf /var/lib/cni/
+rm -rf /var/lib/kubelet/*
+rm -rf /etc/cni/
+ifconfig cni0 down
+ifconfig flannel.1 down
+ifconfig docker0 down
+ip link delete cni0
+ip link delete flannel.1
+systemctl start docker
+
+可以通过任意 NodeIP:Port 在集群外部访问这个服务
+
+kube-proxy开启ipvs
+修改ConfigMap的kube-system/kube-proxy中的config.conf，mode: “ipvs”
+kubectl edit cm kube-proxy -n kube-system
+
+kubectl get pod -n kube-system | grep kube-proxy
+kubectl logs kube-proxy-dx2kh -n kube-system
+
+验证DNS, pod Network
+kubectl run -it curl --image=radial/busyboxplus:curl
+kubectl run curl --image=radial/busyboxplus:curl -it
+
+nslookup kubernetes.default
+nslookup nginx
+kubectl exec -ti <your-pod-name>  -n <your-namespace>  -- /bin/sh
+kubectl exec -ti curl-66959f6557-m8djf  -n default  -- /bin/sh
+kubectl patch svc kubernetes-dashboard -p '{"spec":{"type":"NodePort"}}' -n kube-system
+cd /etc/kubernetes/pki/
+(umask 007,openssl genrsa -out dashboard.key 2048)
+openssl req -new -key dashboard.key -out dashboard.csr -subj "/O=magude/CN=dashboard"
+openssl x509 -req -in dashboard.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out dashboard.crt -days 365
+kubectl create secret generic dashboard-cert -n kube-system --from-file=dashboard.crt=./dashboard.crt --from-file=dashboard.key=./dashboard.key
+kubectl get secret -n kube-system
+
+token认证
+kubectl create serviceaccount dashboard-admin -n kube-system
+kubectl create clusterrolebinding dashboard-cluster-admin --clusterrole=cluster-admin --serviceaccount=kube-system:dashboard-admin
+kubectl get secret -n kube-system
+kubectl describe secret dashboard-admin-token-bzsxb -n kube-system 
+
+kubectl delete clusterrolebinding dashboard-cluster-admin --clusterrole=cluster-admin --serviceaccount=kube-system:dashboard-admin
+kubectl delete serviceaccount dashboard-admin -n kube-system
+
+https://www.jianshu.com/p/748746c696c6
+
+Error syncing pod, skipping: failed to "StartContainer" for "POD" with ErrImagePull: "image pull failed for registry.access.redhat.com/rhel7/pod-infrastructure:latest, this may be because there are no credentials on this request.  details: (open /etc/docker/certs.d/registry.access.redhat.com/redhat-ca.crt: no such file or directory)"
+yum install -y *rhsm*
+
+线上的kubeadm join 172.16.28.250:6443 --token 1r76lr.e9uh97178r8hqn2c --discovery-token-ca-cert-hash sha256:68ff99de26aec7466748192b56146d57a178005a75a5f5b8370f8d49c4a2c922 --ignore-preflight-errors=Swap
+kubeadm join 172.16.38.146:6443 --token xgr6tb.qz49lxz2p4ftx6vt --discovery-token-ca-cert-hash sha256:8a7432cfee5f1d4c4f3be4c4f29faa166c18e9e51558eeaee79c48df4bad98a1 --ignore-preflight-errors=Swap
+
+docker build -f ./liushu-eureka-server-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-eureka-server:1.0.0 .
+docker build -f ./liushu-zuul-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-zuul:latest .
+docker build -f ./liushu-sso-service-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-sso-service:latest .
+docker build -f ./liushu-user-service-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-user-service:latest .
+docker build -f ./liushu-browser-history-server-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-browser-history-server:latest .
+docker build -f ./liushu-pc-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-pc:latest .
+docker build -f ./liushu-admin-service-Dockerfile -t registry.cn-beijing.aliyuncs.com/luozuyi/liushu-admin-service:latest .
+
+kubectl scale --replicas=2 -f liushu-sso-service-deployment.yaml #动态伸缩
+kubectl exec -ti <your-pod-name>  -n <your-namespace>  -- /bin/sh
+cp /root/.docker/config.json /var/lib/kubelet/config.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# kubectl apply -f  node-exporter.yaml 
+# kubectl apply -f  rbac-setup.yaml
+# kubectl apply -f  configmap.yaml 
+# kubectl apply -f  prometheus.deploy.yml 
+# kubectl apply -f  prometheus.svc.yml 
+# kubectl apply -f  grafana-deploy.yaml 
+# kubectl apply -f  grafana-svc.yaml
+# kubectl apply -f  grafana-ing.yaml 
+
+sum by (pod_name)( rate(container_cpu_usage_seconds_total{image!="", pod_name!=""}[1m] ) )
